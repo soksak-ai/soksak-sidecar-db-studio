@@ -1,0 +1,7 @@
+{
+  "id": "soksak-sidecar-db-studio",
+  "version": "0.0.1",
+  "releaseTag": "v0.0.1",
+  "repository": "https://github.com/soksak-ai/soksak-sidecar-db-studio",
+  "interface": { "id": "soksak-spec-sidecar-db-studio", "version": "0.0.1" }
+}

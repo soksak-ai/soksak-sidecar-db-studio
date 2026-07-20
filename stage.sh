@@ -1,27 +1,32 @@
-#!/usr/bin/env sh
-# Build the DB Studio sidecar and stage it into dist/ for local core-routed
-# loading (the core resolves sidecar:<name> from <home>/sidecars/<name>/dist/<bin>).
-# Idempotent: rebuild, then atomically replace dist/<bin> with a real file copy
-# (no symlink — A17). No publishing. Usage: ./stage.sh [debug|release]
-set -eu
+#!/usr/bin/env bash
+# Build the sidecar and stage it into <dist>/ for local core-routed loading, or cross-build for a
+# release target (the 5-platform CI matrix calls `./stage.sh dist <triple>`). No native engine —
+# a service sidecar is a plain cargo build. Usage: stage.sh [<dist-dir>] [<target-triple>]
+set -euo pipefail
+export PATH="$HOME/.cargo/bin:$PATH"
 
-here="$(cd "$(dirname "$0")" && pwd)"
-cd "$here"
+dist="${1:-dist}"
+target="${2:-}"
+name="soksak-sidecar-db-studio"
 
-# GUI/background shells often lack cargo on PATH — add rustup's bin.
-command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
-export PATH
+ext=""
+case "$target" in *windows*) ext=".exe" ;; esac
 
-bin=soksak-sidecar-db-studio
-profile="${1:-debug}"
-case "$profile" in
-  release) cargo build --release; src="target/release/$bin" ;;
-  debug)   cargo build;           src="target/debug/$bin" ;;
-  *) echo "usage: $0 [debug|release]" >&2; exit 2 ;;
-esac
+if [ -n "$target" ]; then
+  cargo build --release --target "$target" --bin "$name"
+  reldir="$target/release"
+else
+  cargo build --release --bin "$name"
+  reldir="release"
+fi
 
-mkdir -p dist
-tmp="dist/.$bin.stage.$$"
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+src="$TARGET_DIR/$reldir/$name$ext"
+[ -f "$src" ] || { echo "release binary not found at $src" >&2; exit 1; }
+
+mkdir -p "$dist"
+tmp="$dist/.$name.tmp.$$"
 cp "$src" "$tmp"
-mv -f "$tmp" "dist/$bin"   # atomic within the same filesystem
-echo "staged: $here/dist/$bin ($profile)"
+chmod +x "$tmp"
+mv -f "$tmp" "$dist/$name$ext"
+echo "staged: $dist/$name$ext"
