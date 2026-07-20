@@ -14,8 +14,6 @@ use std::sync::Mutex;
 use serde_json::{json, Value};
 use soksak_spec_service::{serve_stdio, Emit, ErrCode, OpCtx, Outcome, ServiceHandler};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 /// Default cap on rows returned by query-run when the caller omits `rowLimit`.
 const DEFAULT_ROW_LIMIT: usize = 1000;
 
