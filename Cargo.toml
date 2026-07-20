@@ -1,0 +1,23 @@
+[package]
+name = "soksak-sidecar-db-studio"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.96"
+publish = false
+license = "MIT"
+repository = "https://github.com/soksak-ai/soksak-sidecar-db-studio"
+description = "DB Studio service sidecar — connects to a database and runs introspection, queries, and migrations behind the plugin service wire. SQLite driver first (MySQL/PostgreSQL follow)."
+
+[[bin]]
+name = "soksak-sidecar-db-studio"
+path = "src/main.rs"
+
+[lib]
+name = "soksak_sidecar_db_studio"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+rusqlite = { version = "0.32", features = ["bundled"] }
+soksak-spec-service = { git = "https://github.com/soksak-ai/soksak-spec.git", rev = "d7f54852754195527f125d1fc11362316157d19b", package = "soksak-spec-service" }
