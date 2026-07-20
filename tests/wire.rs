@@ -36,7 +36,30 @@ fn req(id: u64, op: &str, params: Value) -> ServiceIn {
     }
 }
 
-/// Run one req and return its res data, skipping any streamed ev/act frames.
+/// Run one req and return (ok, data), skipping any streamed ev/act frames.
+fn call_res(
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
+    id: u64,
+    op: &str,
+    params: Value,
+) -> (bool, Value) {
+    send(stdin, &req(id, op, params));
+    loop {
+        match recv(stdout) {
+            ServiceOut::Res {
+                id: rid, ok, data, ..
+            } => {
+                assert_eq!(rid, id);
+                return (ok, data.unwrap_or(Value::Null));
+            }
+            ServiceOut::Ev { .. } | ServiceOut::Act { .. } => continue,
+            other => panic!("unexpected frame for {op}: {other:?}"),
+        }
+    }
+}
+
+/// Run one req that must succeed and return its data.
 fn call(
     stdin: &mut ChildStdin,
     stdout: &mut BufReader<ChildStdout>,
@@ -44,25 +67,28 @@ fn call(
     op: &str,
     params: Value,
 ) -> Value {
-    send(stdin, &req(id, op, params));
-    loop {
-        match recv(stdout) {
-            ServiceOut::Res {
-                id: rid,
-                ok,
-                code,
-                message,
-                data,
-                ..
-            } => {
-                assert_eq!(rid, id);
-                assert!(ok, "op {op} failed: {code:?} {message:?}");
-                return data.unwrap_or(Value::Null);
-            }
-            ServiceOut::Ev { .. } | ServiceOut::Act { .. } => continue,
-            other => panic!("unexpected frame for {op}: {other:?}"),
-        }
+    let (ok, data) = call_res(stdin, stdout, id, op, params);
+    assert!(ok, "op {op} failed: {data:?}");
+    data
+}
+
+/// Spawn the serve binary and complete the hello/ready handshake.
+fn spawn_and_ready() -> (Child, ChildStdin, BufReader<ChildStdout>) {
+    let mut child: Child = Command::new(env!("CARGO_BIN_EXE_soksak-sidecar-db-studio"))
+        .arg("serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    match recv(&mut stdout) {
+        ServiceOut::Hello(_) => {}
+        other => panic!("first frame must be hello: {other:?}"),
     }
+    send(&mut stdin, &ServiceIn::Ready);
+    (child, stdin, stdout)
 }
 
 #[test]
@@ -166,5 +192,81 @@ fn wire_read_path_against_real_sqlite() {
     send(&mut stdin, &ServiceIn::Shutdown);
     let status = child.wait().unwrap();
     assert!(status.success() || status.code().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn wire_encryption_lifecycle_against_real_sqlite() {
+    // Full at-rest encryption lifecycle over the wire on a real encrypted
+    // SQLite (SQLCipher) file: create -> reject-without-key -> open-with-key ->
+    // rekey -> old-key-fails/new-key-works. No server, no publishing.
+    let dir = std::env::temp_dir().join(format!("db-studio-wire-enc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("vault.sqlite").to_string_lossy().to_string();
+    let (old_key, new_key) = ("old-secret", "new-secret");
+
+    let (mut child, mut stdin, mut stdout) = spawn_and_ready();
+
+    // create an encrypted database
+    let d = call(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "db-create",
+        json!({ "file": path, "key": old_key }),
+    );
+    assert_eq!(d["encrypted"], true);
+
+    // connecting without the key is refused over the wire
+    let (ok, _) = call_res(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "db-connect",
+        json!({ "profile": "v", "file": path }),
+    );
+    assert!(!ok, "encrypted db must not open without a key");
+
+    // connecting with the key works
+    let d = call(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "db-connect",
+        json!({ "profile": "v", "file": path, "key": old_key }),
+    );
+    assert_eq!(d["encrypted"], true);
+
+    // rotate the key in place, then drop the connection
+    let d = call(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "db-rekey",
+        json!({ "profile": "v", "newKey": new_key }),
+    );
+    assert_eq!(d["rekeyed"], true);
+    call(&mut stdin, &mut stdout, 5, "db-disconnect", json!({ "profile": "v" }));
+
+    // the old key no longer opens it; the new key does
+    let (ok_old, _) = call_res(
+        &mut stdin,
+        &mut stdout,
+        6,
+        "db-connect",
+        json!({ "profile": "v2", "file": path, "key": old_key }),
+    );
+    assert!(!ok_old, "old key must fail after rekey");
+    let (ok_new, _) = call_res(
+        &mut stdin,
+        &mut stdout,
+        7,
+        "db-connect",
+        json!({ "profile": "v3", "file": path, "key": new_key }),
+    );
+    assert!(ok_new, "new key must work after rekey");
+
+    send(&mut stdin, &ServiceIn::Shutdown);
+    let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -74,23 +74,30 @@ impl DbStudioService {
             Some(p) => p.to_string(),
             None => return Outcome::err(ErrCode::InvalidParams, "profile required"),
         };
-        // Phase 1: SQLite only. `file` is the database path (":memory:" default).
+        // Phase 1: SQLite only. `file` is the database path (":memory:" default);
+        // an optional `key` opens an encrypted (SQLCipher) database.
         let file = params.get("file").and_then(Value::as_str).unwrap_or(":memory:");
-        match rusqlite::Connection::open(file) {
-            Ok(conn) => {
-                let version = sqlite_version(&conn);
-                self.lock().insert(profile.clone(), conn);
-                self.audit_append(&profile, "db-connect", true, 0);
-                Outcome::ok_msg(
-                    json!({ "profile": profile, "dialect": "sqlite", "version": version }),
-                    format!("connected: {profile}"),
-                )
-            }
+        let conn = match rusqlite::Connection::open(file) {
+            Ok(c) => c,
             Err(e) => {
                 self.audit_append(&profile, "db-connect", false, 0);
-                Outcome::err(ErrCode::Unavailable, format!("open failed: {e}"))
+                return Outcome::err(ErrCode::Unavailable, format!("open failed: {e}"));
             }
+        };
+        // Validate the key now: a wrong or missing key on an encrypted database
+        // must fail at connect, not on the first later read.
+        if let Err(e) = apply_key(&conn, params).and_then(|()| probe_readable(&conn)) {
+            self.audit_append(&profile, "db-connect", false, 0);
+            return Outcome::err(ErrCode::Unavailable, e);
         }
+        let version = sqlite_version(&conn);
+        let encrypted = params.get("key").and_then(Value::as_str).is_some();
+        self.lock().insert(profile.clone(), conn);
+        self.audit_append(&profile, "db-connect", true, 0);
+        Outcome::ok_msg(
+            json!({ "profile": profile, "dialect": "sqlite", "version": version, "encrypted": encrypted }),
+            format!("connected: {profile}"),
+        )
     }
 
     /// query-run — execute a single read-only SELECT against a live connection.
@@ -316,6 +323,69 @@ impl DbStudioService {
         Outcome::ok(json!({ "connections": profiles, "count": profiles.len() }))
     }
 
+    /// db-create — create a (optionally encrypted) SQLite database. Opens the
+    /// file, applies the key, and materializes the encrypted header with a write.
+    fn db_create(&self, params: &Value) -> Outcome {
+        let file = match params.get("file").and_then(Value::as_str) {
+            Some(f) => f.to_string(),
+            None => return Outcome::err(ErrCode::InvalidParams, "file required"),
+        };
+        let conn = match rusqlite::Connection::open(&file) {
+            Ok(c) => c,
+            Err(e) => return Outcome::err(ErrCode::Unavailable, format!("open failed: {e}")),
+        };
+        if let Err(e) = apply_key(&conn, params) {
+            return Outcome::err(ErrCode::Unavailable, e);
+        }
+        // A write materializes the (encrypted) database header on disk.
+        if let Err(e) = conn.execute_batch("PRAGMA user_version = 1;") {
+            return Outcome::err(ErrCode::Internal, format!("create failed: {e}"));
+        }
+        let encrypted = params.get("key").and_then(Value::as_str).is_some();
+        self.audit_append("", "db-create", true, 0);
+        Outcome::ok_msg(
+            json!({ "file": file, "dialect": "sqlite", "encrypted": encrypted }),
+            "database created",
+        )
+    }
+
+    /// db-rekey — rotate the encryption key of a held connection. SQLCipher
+    /// `PRAGMA rekey` re-encrypts the whole database in place.
+    fn db_rekey(&self, params: &Value) -> Outcome {
+        let profile = match params.get("profile").and_then(Value::as_str) {
+            Some(p) => p.to_string(),
+            None => return Outcome::err(ErrCode::InvalidParams, "profile required"),
+        };
+        let new_key = match params.get("newKey").and_then(Value::as_str) {
+            Some(k) => k.to_string(),
+            None => return Outcome::err(ErrCode::InvalidParams, "newKey required"),
+        };
+        let result = {
+            let conns = self.lock();
+            match conns.get(&profile) {
+                Some(conn) => conn
+                    .pragma_update(None, "rekey", &new_key)
+                    .map_err(|e| e.to_string()),
+                None => {
+                    return Outcome::err(
+                        ErrCode::Unavailable,
+                        format!("profile not connected: {profile}"),
+                    )
+                }
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.audit_append(&profile, "db-rekey", true, 0);
+                Outcome::ok_msg(json!({ "profile": profile, "rekeyed": true }), "key rotated")
+            }
+            Err(e) => {
+                self.audit_append(&profile, "db-rekey", false, 0);
+                Outcome::err(ErrCode::Internal, format!("rekey failed: {e}"))
+            }
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, rusqlite::Connection>> {
         self.conns.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -324,6 +394,26 @@ impl DbStudioService {
 fn sqlite_version(conn: &rusqlite::Connection) -> String {
     conn.query_row("SELECT sqlite_version()", [], |r| r.get::<_, String>(0))
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Apply the optional SQLCipher key (`PRAGMA key`) right after open — it must run
+/// before any other access. Absent key = a plaintext SQLite database. For the
+/// networked dialects (later) the DSN/secret arrives the same way — via the
+/// core's vault_env injection, never over the wire.
+fn apply_key(conn: &rusqlite::Connection, params: &Value) -> Result<(), String> {
+    if let Some(key) = params.get("key").and_then(Value::as_str) {
+        conn.pragma_update(None, "key", key)
+            .map_err(|e| format!("set key failed: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Touch a real database page so a wrong/absent key is caught now, not later —
+/// `SELECT sqlite_version()` is a builtin and would not detect a bad key.
+fn probe_readable(conn: &rusqlite::Connection) -> Result<(), String> {
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
+        .map(|_| ())
+        .map_err(|e| format!("cannot read database (wrong key or not a database): {e}"))
 }
 
 /// True if a column name matches the sensitive-data pattern (plan §3.3),
@@ -540,13 +630,18 @@ fn op_ping() -> Outcome {
 /// pool entry (distinct from db-connect). Read-only, runs concurrently.
 fn op_db_test(params: &Value) -> Outcome {
     let file = params.get("file").and_then(Value::as_str).unwrap_or(":memory:");
-    match rusqlite::Connection::open(file) {
-        Ok(conn) => Outcome::ok_msg(
-            json!({ "dialect": "sqlite", "version": sqlite_version(&conn), "file": file }),
-            "connection ok",
-        ),
-        Err(e) => Outcome::err(ErrCode::Unavailable, format!("open failed: {e}")),
+    let conn = match rusqlite::Connection::open(file) {
+        Ok(c) => c,
+        Err(e) => return Outcome::err(ErrCode::Unavailable, format!("open failed: {e}")),
+    };
+    if let Err(e) = apply_key(&conn, params).and_then(|()| probe_readable(&conn)) {
+        return Outcome::err(ErrCode::Unavailable, e);
     }
+    let encrypted = params.get("key").and_then(Value::as_str).is_some();
+    Outcome::ok_msg(
+        json!({ "dialect": "sqlite", "version": sqlite_version(&conn), "file": file, "encrypted": encrypted }),
+        "connection ok",
+    )
 }
 
 impl ServiceHandler for DbStudioService {
@@ -557,6 +652,8 @@ impl ServiceHandler for DbStudioService {
             "db-connect",
             "db-disconnect",
             "db-status",
+            "db-create",
+            "db-rekey",
             "query-run",
             "db-introspect",
             "db-audit",
@@ -580,6 +677,8 @@ impl ServiceHandler for DbStudioService {
             "db-connect" => self.db_connect(&params),
             "db-disconnect" => self.db_disconnect(&params),
             "db-status" => self.db_status(),
+            "db-create" => self.db_create(&params),
+            "db-rekey" => self.db_rekey(&params),
             "query-run" => self.query_run(&params),
             "db-introspect" => self.db_introspect(&params),
             "db-audit" => self.db_audit(&params),
@@ -888,5 +987,59 @@ mod tests {
         let entries = d["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["profile"], "p2");
+    }
+
+    #[test]
+    fn encrypted_db_requires_the_key() {
+        let dir = std::env::temp_dir().join(format!("db-studio-enc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("enc.sqlite").to_string_lossy().to_string();
+        let key = "s3cret-pass";
+        let svc = DbStudioService::new();
+
+        let c = svc.db_create(&json!({ "file": path, "key": key }));
+        assert!(c.ok);
+        assert_eq!(c.data.unwrap()["encrypted"], true);
+
+        // opening without the key must fail — the file is unreadable ciphertext
+        let no = svc.db_connect(&json!({ "profile": "e1", "file": path }));
+        assert!(!no.ok, "encrypted db must not open without a key");
+
+        // opening with the correct key works
+        let yes = svc.db_connect(&json!({ "profile": "e2", "file": path, "key": key }));
+        assert!(yes.ok);
+        assert_eq!(yes.data.unwrap()["encrypted"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rekey_rotates_the_encryption_key() {
+        let dir = std::env::temp_dir().join(format!("db-studio-rekey-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.sqlite").to_string_lossy().to_string();
+        let (old_key, new_key) = ("old-pass", "new-pass");
+        let svc = DbStudioService::new();
+
+        assert!(svc.db_create(&json!({ "file": path, "key": old_key })).ok);
+        assert!(svc
+            .db_connect(&json!({ "profile": "r", "file": path, "key": old_key }))
+            .ok);
+
+        // rotate the key on the live connection
+        let rk = svc.db_rekey(&json!({ "profile": "r", "newKey": new_key }));
+        assert!(rk.ok, "rekey failed: {:?}", rk.message);
+        svc.db_disconnect(&json!({ "profile": "r" }));
+
+        // the old key no longer opens the file
+        let old = svc.db_connect(&json!({ "profile": "r2", "file": path, "key": old_key }));
+        assert!(!old.ok, "old key must fail after rekey");
+
+        // the new key does
+        let fresh = DbStudioService::new();
+        let new = fresh.db_connect(&json!({ "profile": "r3", "file": path, "key": new_key }));
+        assert!(new.ok, "new key must work after rekey");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

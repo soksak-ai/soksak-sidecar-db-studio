@@ -19,5 +19,5 @@ path = "src/lib.rs"
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 soksak-spec-service = { git = "https://github.com/soksak-ai/soksak-spec.git", rev = "d7f54852754195527f125d1fc11362316157d19b", package = "soksak-spec-service" }
