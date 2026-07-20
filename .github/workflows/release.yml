@@ -33,6 +33,14 @@ jobs:
         with:
           toolchain: "1.96.0"
           targets: ${{ matrix.target }}
+      # SQLCipher (bundled-sqlcipher-vendored-openssl) builds OpenSSL from source via openssl-src, whose
+      # Configure script needs a capable Perl. The Windows runner's git-bash perl lacks
+      # Locale::Maketext::Simple, so point openssl-src at the runner's Strawberry Perl (openssl-src reads
+      # OPENSSL_SRC_PERL). No-op on Linux/macOS, where the system perl already builds OpenSSL.
+      - name: Point openssl-src at Strawberry Perl (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
       - name: Build and stage the release binary
         shell: bash
         run: ./stage.sh dist "${{ matrix.target }}"
