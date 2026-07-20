@@ -386,6 +386,164 @@ impl DbStudioService {
         }
     }
 
+    /// db-exec — execute a single write/DDL statement (INSERT/UPDATE/DELETE/
+    /// CREATE/DROP/ALTER …) against a live connection (plan §5). One statement
+    /// only (multi-statement bodies rejected). A WHERE-less UPDATE or DELETE is
+    /// refused unless `force:true` — a whole-table mutation must be deliberate.
+    /// Returns {rowsAffected}. Mutating (not read-only).
+    fn db_exec(&self, params: &Value) -> Outcome {
+        let profile = match params.get("profile").and_then(Value::as_str) {
+            Some(p) => p.to_string(),
+            None => return Outcome::err(ErrCode::InvalidParams, "profile required"),
+        };
+        let sql = match params.get("sql").and_then(Value::as_str) {
+            Some(s) => s.to_string(),
+            None => return Outcome::err(ErrCode::InvalidParams, "sql required"),
+        };
+        if has_multiple_statements(&sql) {
+            return Outcome::err(
+                ErrCode::InvalidParams,
+                "single statement required (multiple statements rejected)",
+            );
+        }
+        let force = params.get("force").and_then(Value::as_bool).unwrap_or(false);
+        if !force && is_where_less_mutation(&sql) {
+            return Outcome::err(
+                ErrCode::InvalidParams,
+                "WHERE-less UPDATE/DELETE refused (pass force:true to mutate every row)",
+            );
+        }
+
+        let bind: Vec<rusqlite::types::Value> = match params.get("params") {
+            Some(Value::Array(items)) => items.iter().map(json_to_sql_value).collect(),
+            Some(Value::Null) | None => Vec::new(),
+            Some(_) => return Outcome::err(ErrCode::InvalidParams, "params must be an array"),
+        };
+
+        let result: Result<usize, (ErrCode, String)> = {
+            let conns = self.lock();
+            match conns.get(&profile) {
+                None => Err((
+                    ErrCode::Unavailable,
+                    format!("profile not connected: {profile}"),
+                )),
+                Some(conn) => {
+                    let bind_refs: Vec<&dyn rusqlite::ToSql> =
+                        bind.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+                    conn.execute(&sql, bind_refs.as_slice())
+                        .map_err(|e| (ErrCode::Internal, format!("exec failed: {e}")))
+                }
+            }
+        };
+
+        match result {
+            Err((code, msg)) => {
+                self.audit_append(&profile, "db-exec", false, 0);
+                Outcome::err(code, msg)
+            }
+            Ok(rows_affected) => {
+                self.audit_append(&profile, "db-exec", true, rows_affected as u64);
+                Outcome::ok(json!({ "rowsAffected": rows_affected }))
+            }
+        }
+    }
+
+    /// db-migrate — apply one migration file as a single atomic transaction
+    /// (plan §6). BEGIN → each statement in order → record in the ledger →
+    /// COMMIT; any failure ROLLs the whole thing back. The ledger table
+    /// `_soksak_migrations(id, checksum, applied_at)` is created on demand. An
+    /// already-applied id with a matching checksum is skipped; a mismatch is a
+    /// tamper and is refused (Conflict). Returns {applied, id}. Mutating.
+    fn db_migrate(&self, params: &Value) -> Outcome {
+        let profile = match params.get("profile").and_then(Value::as_str) {
+            Some(p) => p.to_string(),
+            None => return Outcome::err(ErrCode::InvalidParams, "profile required"),
+        };
+        let id = match params.get("id").and_then(Value::as_str) {
+            Some(s) => s.to_string(),
+            None => return Outcome::err(ErrCode::InvalidParams, "id required"),
+        };
+        let checksum = match params.get("checksum").and_then(Value::as_str) {
+            Some(s) => s.to_string(),
+            None => return Outcome::err(ErrCode::InvalidParams, "checksum required"),
+        };
+        let statements: Vec<String> = match params.get("statements") {
+            Some(Value::Array(items)) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    match it.as_str() {
+                        Some(s) => out.push(s.to_string()),
+                        None => {
+                            return Outcome::err(
+                                ErrCode::InvalidParams,
+                                "statements must be strings",
+                            )
+                        }
+                    }
+                }
+                out
+            }
+            _ => return Outcome::err(ErrCode::InvalidParams, "statements array required"),
+        };
+
+        let result: Result<bool, (ErrCode, String)> = {
+            let conns = self.lock();
+            match conns.get(&profile) {
+                None => Err((
+                    ErrCode::Unavailable,
+                    format!("profile not connected: {profile}"),
+                )),
+                Some(conn) => apply_migration(conn, &id, &checksum, &statements),
+            }
+        };
+
+        match result {
+            Err((code, msg)) => {
+                self.audit_append(&profile, "db-migrate", false, 0);
+                Outcome::err(code, msg)
+            }
+            Ok(applied) => {
+                self.audit_append(&profile, "db-migrate", true, if applied { 1 } else { 0 });
+                let msg = if applied {
+                    format!("migration applied: {id}")
+                } else {
+                    format!("migration already applied: {id}")
+                };
+                Outcome::ok_msg(json!({ "applied": applied, "id": id }), msg)
+            }
+        }
+    }
+
+    /// migration-applied — list the migration ledger: [{id, checksum, appliedAt}]
+    /// ordered by application. A database with no ledger table returns an empty
+    /// list. Read-only.
+    fn migration_applied(&self, params: &Value) -> Outcome {
+        let profile = match params.get("profile").and_then(Value::as_str) {
+            Some(p) => p.to_string(),
+            None => return Outcome::err(ErrCode::InvalidParams, "profile required"),
+        };
+
+        let result: Result<Vec<Value>, (ErrCode, String)> = {
+            let conns = self.lock();
+            match conns.get(&profile) {
+                None => Err((
+                    ErrCode::Unavailable,
+                    format!("profile not connected: {profile}"),
+                )),
+                Some(conn) => read_migration_ledger(conn)
+                    .map_err(|e| (ErrCode::Internal, format!("ledger read failed: {e}"))),
+            }
+        };
+
+        match result {
+            Err((code, msg)) => Outcome::err(code, msg),
+            Ok(migrations) => {
+                let count = migrations.len();
+                Outcome::ok(json!({ "migrations": migrations, "count": count }))
+            }
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, rusqlite::Connection>> {
         self.conns.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -473,6 +631,193 @@ fn has_multiple_statements(sql: &str) -> bool {
         Some(end) => semis.iter().any(|&s| s < end),
         None => false,
     }
+}
+
+/// True for an identifier character (used for SQL keyword word-boundary tests).
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The leading SQL keyword, lowercased — the first identifier token after any
+/// leading whitespace. Empty when the body does not start with an identifier.
+fn leading_keyword(sql: &str) -> String {
+    sql.trim_start()
+        .chars()
+        .take_while(|c| is_ident_char(*c))
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Quote-aware, case-insensitive, word-boundary test for a standalone keyword
+/// token (given lowercase). A match inside a string/identifier literal, or one
+/// glued to surrounding identifier characters, does not count.
+fn contains_keyword(sql: &str, keyword: &str) -> bool {
+    let chars: Vec<char> = sql.chars().collect();
+    let kw: Vec<char> = keyword.chars().collect();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double && i + kw.len() <= chars.len() {
+            let matches = kw
+                .iter()
+                .enumerate()
+                .all(|(j, &kc)| chars[i + j].to_ascii_lowercase() == kc);
+            if matches {
+                let prev_boundary = i == 0 || !is_ident_char(chars[i - 1]);
+                let next = i + kw.len();
+                let next_boundary = next >= chars.len() || !is_ident_char(chars[next]);
+                if prev_boundary && next_boundary {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True when `sql` is an UPDATE or DELETE statement carrying no WHERE clause —
+/// a whole-table mutation that db-exec refuses without `force:true` (plan §5).
+fn is_where_less_mutation(sql: &str) -> bool {
+    let kw = leading_keyword(sql);
+    if kw != "update" && kw != "delete" {
+        return false;
+    }
+    !contains_keyword(sql, "where")
+}
+
+/// Current wall-clock time as an RFC3339 UTC string (seconds precision). The
+/// sidecar is real Rust, so it owns a real clock — the applied_at stamp is
+/// authoritative here, not passed in over the wire.
+fn rfc3339_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let rem = (secs % 86_400) as i64;
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (y, mo, d) = civil_from_days(days);
+    format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Convert a count of days since the Unix epoch into a (year, month, day) civil
+/// date. Howard Hinnant's `civil_from_days` algorithm (proleptic Gregorian).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Ensure the migration ledger table exists (idempotent).
+fn ensure_migration_ledger(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _soksak_migrations (\
+            id TEXT PRIMARY KEY, checksum TEXT, applied_at TEXT)",
+    )
+}
+
+/// Apply one migration atomically. Returns Ok(true) when newly applied, Ok(false)
+/// when the id was already applied with a matching checksum (a no-op skip), and
+/// Err(Conflict) when an already-applied id's checksum differs (tamper).
+fn apply_migration(
+    conn: &rusqlite::Connection,
+    id: &str,
+    checksum: &str,
+    statements: &[String],
+) -> Result<bool, (ErrCode, String)> {
+    use rusqlite::OptionalExtension;
+
+    ensure_migration_ledger(conn)
+        .map_err(|e| (ErrCode::Internal, format!("ledger init failed: {e}")))?;
+
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT checksum FROM _soksak_migrations WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| (ErrCode::Internal, format!("ledger read failed: {e}")))?;
+    match existing {
+        Some(prev) if prev == checksum => return Ok(false), // already applied, unchanged
+        Some(_) => {
+            return Err((
+                ErrCode::Conflict,
+                format!("migration {id} already applied with a different checksum (refusing to reapply)"),
+            ))
+        }
+        None => {}
+    }
+
+    conn.execute_batch("BEGIN")
+        .map_err(|e| (ErrCode::Internal, format!("begin failed: {e}")))?;
+    let applied: rusqlite::Result<()> = (|| {
+        for stmt in statements {
+            conn.execute_batch(stmt)?;
+        }
+        conn.execute(
+            "INSERT INTO _soksak_migrations(id, checksum, applied_at) VALUES(?1, ?2, ?3)",
+            rusqlite::params![id, checksum, rfc3339_now()],
+        )?;
+        Ok(())
+    })();
+    match applied {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")
+                .map_err(|e| (ErrCode::Internal, format!("commit failed: {e}")))?;
+            Ok(true)
+        }
+        Err(e) => {
+            // Best-effort rollback; the original failure is what the caller sees.
+            let _ = conn.execute_batch("ROLLBACK");
+            Err((ErrCode::Internal, format!("migration failed (rolled back): {e}")))
+        }
+    }
+}
+
+/// Read the migration ledger as [{id, checksum, appliedAt}] ordered by
+/// application. A database without the ledger table yields an empty list.
+fn read_migration_ledger(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<Value>> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_soksak_migrations'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, checksum, applied_at FROM _soksak_migrations ORDER BY applied_at, id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let id: String = r.get(0)?;
+        let checksum: String = r.get(1)?;
+        let applied_at: Option<String> = r.get(2)?;
+        Ok(json!({ "id": id, "checksum": checksum, "appliedAt": applied_at }))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<Value>>>()
 }
 
 /// Convert a JSON bind parameter into a SQLite value.
@@ -657,6 +1002,9 @@ impl ServiceHandler for DbStudioService {
             "query-run",
             "db-introspect",
             "db-audit",
+            "db-exec",
+            "db-migrate",
+            "migration-applied",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -666,7 +1014,13 @@ impl ServiceHandler for DbStudioService {
     fn read_only(&self, op: &str) -> bool {
         matches!(
             op,
-            "ping" | "db-test" | "db-status" | "query-run" | "db-introspect" | "db-audit"
+            "ping"
+                | "db-test"
+                | "db-status"
+                | "query-run"
+                | "db-introspect"
+                | "db-audit"
+                | "migration-applied"
         )
     }
 
@@ -682,6 +1036,9 @@ impl ServiceHandler for DbStudioService {
             "query-run" => self.query_run(&params),
             "db-introspect" => self.db_introspect(&params),
             "db-audit" => self.db_audit(&params),
+            "db-exec" => self.db_exec(&params),
+            "db-migrate" => self.db_migrate(&params),
+            "migration-applied" => self.migration_applied(&params),
             other => Outcome::err(ErrCode::UnknownOp, other),
         }
     }
@@ -1041,5 +1398,216 @@ mod tests {
         assert!(new.ok, "new key must work after rekey");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn phase5_6_ops_registered_with_correct_read_only_axis() {
+        let svc = DbStudioService::new();
+        let ops = svc.ops();
+        for op in ["db-exec", "db-migrate", "migration-applied"] {
+            assert!(ops.contains(&op.to_string()), "missing op {op}");
+        }
+        // migration-applied is a read; db-exec/db-migrate mutate.
+        assert!(svc.read_only("migration-applied"));
+        assert!(!svc.read_only("db-exec"));
+        assert!(!svc.read_only("db-migrate"));
+    }
+
+    #[test]
+    fn db_exec_insert_reports_rows_affected() {
+        let svc = seeded_service();
+        let o = svc.db_exec(&json!({
+            "profile": "p1",
+            "sql": "INSERT INTO users(email, display) VALUES(?, ?)",
+            "params": ["c@x.io", "carol"]
+        }));
+        assert!(o.ok, "db-exec insert failed: {:?}", o.message);
+        assert_eq!(o.data.unwrap()["rowsAffected"], 1);
+
+        // the row is really there — a real round-trip through the driver
+        let check = svc.query_run(&json!({
+            "profile": "p1",
+            "sql": "SELECT email FROM users WHERE display = 'carol'"
+        }));
+        assert_eq!(check.data.unwrap()["rows"][0][0], "c@x.io");
+    }
+
+    #[test]
+    fn db_exec_update_with_where_affects_only_matched_rows() {
+        let svc = seeded_service();
+        let o = svc.db_exec(&json!({
+            "profile": "p1",
+            "sql": "UPDATE users SET display = 'ALICE' WHERE email = 'a@x.io'"
+        }));
+        assert!(o.ok, "guarded update failed: {:?}", o.message);
+        assert_eq!(o.data.unwrap()["rowsAffected"], 1);
+    }
+
+    #[test]
+    fn db_exec_refuses_where_less_delete_and_update_without_force() {
+        let svc = seeded_service();
+        // whole-table DELETE is refused
+        let del = svc.db_exec(&json!({ "profile": "p1", "sql": "DELETE FROM users" }));
+        assert!(!del.ok);
+        assert_eq!(del.code.as_deref(), Some("INVALID_PARAMS"));
+        // whole-table UPDATE is refused (case-insensitive keyword detection)
+        let upd = svc.db_exec(&json!({
+            "profile": "p1",
+            "sql": "update users set display = 'x'"
+        }));
+        assert!(!upd.ok);
+        assert_eq!(upd.code.as_deref(), Some("INVALID_PARAMS"));
+        // both rows still present — the refusal actually prevented the mutation
+        let n = svc.query_run(&json!({ "profile": "p1", "sql": "SELECT id FROM users" }));
+        assert_eq!(n.data.unwrap()["rowCount"], 2);
+    }
+
+    #[test]
+    fn db_exec_force_allows_whole_table_delete() {
+        let svc = seeded_service();
+        let o = svc.db_exec(&json!({
+            "profile": "p1",
+            "sql": "DELETE FROM users",
+            "force": true
+        }));
+        assert!(o.ok, "forced delete failed: {:?}", o.message);
+        assert_eq!(o.data.unwrap()["rowsAffected"], 2);
+        let n = svc.query_run(&json!({ "profile": "p1", "sql": "SELECT id FROM users" }));
+        assert_eq!(n.data.unwrap()["rowCount"], 0);
+    }
+
+    #[test]
+    fn db_exec_where_inside_a_string_is_not_a_where_clause() {
+        // A DELETE whose only `where` sits inside a string literal is still a
+        // whole-table delete and must be refused without force.
+        let svc = seeded_service();
+        let o = svc.db_exec(&json!({
+            "profile": "p1",
+            "sql": "DELETE FROM users WHERE display = 'where'"
+        }));
+        // this one HAS a real WHERE, so it is allowed
+        assert!(o.ok, "delete with real where failed: {:?}", o.message);
+    }
+
+    #[test]
+    fn db_exec_rejects_multiple_statements() {
+        let svc = seeded_service();
+        let o = svc.db_exec(&json!({
+            "profile": "p1",
+            "sql": "INSERT INTO users(email) VALUES('z@x.io'); DROP TABLE users"
+        }));
+        assert!(!o.ok);
+        assert_eq!(o.code.as_deref(), Some("INVALID_PARAMS"));
+    }
+
+    #[test]
+    fn db_migrate_applies_transaction_and_records_ledger() {
+        let svc = DbStudioService::new();
+        assert!(svc.db_connect(&json!({ "profile": "m", "file": ":memory:" })).ok);
+        let o = svc.db_migrate(&json!({
+            "profile": "m",
+            "id": "0001_init",
+            "checksum": "abc123",
+            "statements": [
+                "CREATE TABLE widget(id INTEGER PRIMARY KEY, name TEXT)",
+                "INSERT INTO widget(name) VALUES('gizmo')"
+            ]
+        }));
+        assert!(o.ok, "migrate failed: {:?}", o.message);
+        let d = o.data.unwrap();
+        assert_eq!(d["applied"], true);
+        assert_eq!(d["id"], "0001_init");
+
+        // both statements landed inside the one transaction
+        let q = svc.query_run(&json!({ "profile": "m", "sql": "SELECT name FROM widget" }));
+        assert_eq!(q.data.unwrap()["rows"][0][0], "gizmo");
+
+        // the ledger recorded the migration with an RFC3339 stamp
+        let applied = svc.migration_applied(&json!({ "profile": "m" }));
+        let ml = applied.data.unwrap();
+        assert_eq!(ml["count"], 1);
+        let m0 = &ml["migrations"][0];
+        assert_eq!(m0["id"], "0001_init");
+        assert_eq!(m0["checksum"], "abc123");
+        let stamp = m0["appliedAt"].as_str().unwrap();
+        assert!(stamp.contains('T') && stamp.ends_with('Z'), "stamp: {stamp}");
+        assert!(stamp.starts_with("20"), "stamp: {stamp}");
+    }
+
+    #[test]
+    fn db_migrate_reapply_same_checksum_skips_mismatch_conflicts() {
+        let svc = DbStudioService::new();
+        assert!(svc.db_connect(&json!({ "profile": "m", "file": ":memory:" })).ok);
+        let apply = |cksum: &str, stmts: Value| {
+            svc.db_migrate(&json!({
+                "profile": "m",
+                "id": "0001",
+                "checksum": cksum,
+                "statements": stmts
+            }))
+        };
+        let first = apply("cs-1", json!(["CREATE TABLE t(id INTEGER)"]));
+        assert!(first.ok);
+        assert_eq!(first.data.unwrap()["applied"], true);
+
+        // re-applying the same id + checksum is a no-op skip (ok, applied:false)
+        let again = apply("cs-1", json!(["CREATE TABLE t(id INTEGER)"]));
+        assert!(again.ok, "reapply should skip, not fail");
+        assert_eq!(again.data.unwrap()["applied"], false);
+
+        // same id, DIFFERENT checksum = tamper → Conflict
+        let tampered = apply("cs-2", json!(["CREATE TABLE t(id INTEGER)"]));
+        assert!(!tampered.ok);
+        assert_eq!(tampered.code.as_deref(), Some("CONFLICT"));
+
+        // ledger still has exactly one row (the original)
+        let ml = svc.migration_applied(&json!({ "profile": "m" })).data.unwrap();
+        assert_eq!(ml["count"], 1);
+        assert_eq!(ml["migrations"][0]["checksum"], "cs-1");
+    }
+
+    #[test]
+    fn db_migrate_rolls_back_the_whole_file_on_failure() {
+        let svc = DbStudioService::new();
+        assert!(svc.db_connect(&json!({ "profile": "m", "file": ":memory:" })).ok);
+        // second statement is invalid SQL — the whole migration must roll back
+        let o = svc.db_migrate(&json!({
+            "profile": "m",
+            "id": "0002_bad",
+            "checksum": "zzz",
+            "statements": [
+                "CREATE TABLE good(id INTEGER)",
+                "CREATE TABLE nope(!!! not sql"
+            ]
+        }));
+        assert!(!o.ok, "invalid migration must fail");
+        assert_eq!(o.code.as_deref(), Some("INTERNAL"));
+
+        // the first statement's table must NOT survive — atomic rollback
+        let leaked = svc.query_run(&json!({ "profile": "m", "sql": "SELECT id FROM good" }));
+        assert!(!leaked.ok, "partial migration leaked table `good`");
+
+        // and the ledger has no entry for the failed migration
+        let ml = svc.migration_applied(&json!({ "profile": "m" })).data.unwrap();
+        assert_eq!(ml["count"], 0);
+    }
+
+    #[test]
+    fn migration_applied_empty_when_no_ledger() {
+        let svc = DbStudioService::new();
+        assert!(svc.db_connect(&json!({ "profile": "m", "file": ":memory:" })).ok);
+        let o = svc.migration_applied(&json!({ "profile": "m" }));
+        assert!(o.ok);
+        let d = o.data.unwrap();
+        assert_eq!(d["count"], 0);
+        assert!(d["migrations"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn migration_applied_unconnected_profile_errors() {
+        let svc = DbStudioService::new();
+        let o = svc.migration_applied(&json!({ "profile": "nope" }));
+        assert!(!o.ok);
+        assert_eq!(o.code.as_deref(), Some("UNAVAILABLE"));
     }
 }

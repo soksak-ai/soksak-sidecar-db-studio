@@ -270,3 +270,103 @@ fn wire_encryption_lifecycle_against_real_sqlite() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn wire_migration_lifecycle_against_real_sqlite() {
+    // Migration/write axis over the wire on a real SQLite file:
+    // connect -> migrate (atomic, ledger) -> migration-applied -> db-exec.
+    let dir = std::env::temp_dir().join(format!("db-studio-wire-mig-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dbpath = dir.join("app.sqlite").to_string_lossy().to_string();
+
+    let (mut child, mut stdin, mut stdout) = spawn_and_ready();
+
+    call(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "db-connect",
+        json!({ "profile": "app", "file": dbpath }),
+    );
+
+    // apply a migration atomically — DDL + seed in one transaction
+    let d = call(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "db-migrate",
+        json!({
+            "profile": "app",
+            "id": "0001_schema",
+            "checksum": "deadbeef",
+            "statements": [
+                "CREATE TABLE task(id INTEGER PRIMARY KEY, title TEXT, done INTEGER DEFAULT 0)",
+                "INSERT INTO task(title) VALUES('first')"
+            ]
+        }),
+    );
+    assert_eq!(d["applied"], true);
+    assert_eq!(d["id"], "0001_schema");
+
+    // the ledger reports the applied migration with an RFC3339 stamp
+    let d = call(&mut stdin, &mut stdout, 3, "migration-applied", json!({ "profile": "app" }));
+    assert_eq!(d["count"], 1);
+    let m0 = &d["migrations"][0];
+    assert_eq!(m0["id"], "0001_schema");
+    assert_eq!(m0["checksum"], "deadbeef");
+    let stamp = m0["appliedAt"].as_str().unwrap();
+    assert!(stamp.contains('T') && stamp.ends_with('Z'), "stamp: {stamp}");
+
+    // re-applying the same id with a DIFFERENT checksum is refused over the wire
+    let (ok_tamper, _) = call_res(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "db-migrate",
+        json!({
+            "profile": "app",
+            "id": "0001_schema",
+            "checksum": "tampered",
+            "statements": ["CREATE TABLE task(id INTEGER PRIMARY KEY)"]
+        }),
+    );
+    assert!(!ok_tamper, "checksum mismatch must be refused");
+
+    // a guarded write against the migrated schema
+    let d = call(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "db-exec",
+        json!({
+            "profile": "app",
+            "sql": "UPDATE task SET done = 1 WHERE title = ?",
+            "params": ["first"]
+        }),
+    );
+    assert_eq!(d["rowsAffected"], 1);
+
+    // a WHERE-less UPDATE is refused over the wire without force
+    let (ok_bare, _) = call_res(
+        &mut stdin,
+        &mut stdout,
+        6,
+        "db-exec",
+        json!({ "profile": "app", "sql": "UPDATE task SET done = 0" }),
+    );
+    assert!(!ok_bare, "WHERE-less UPDATE must be refused over the wire");
+
+    // the mutation really landed: read it back masked-free (non-sensitive col)
+    let d = call(
+        &mut stdin,
+        &mut stdout,
+        7,
+        "query-run",
+        json!({ "profile": "app", "sql": "SELECT done FROM task WHERE title = 'first'" }),
+    );
+    assert_eq!(d["rows"][0][0], 1);
+
+    send(&mut stdin, &ServiceIn::Shutdown);
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
