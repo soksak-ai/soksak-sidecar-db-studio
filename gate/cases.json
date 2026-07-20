@@ -1,0 +1,47 @@
+[
+  {
+    "name": "prod DROP TABLE is negotiable-free deny (grade 3)",
+    "input": { "commandId": "db-exec", "opClass": "ddl", "profile": { "environment": "prod" } },
+    "expect": { "grade": 3, "action": "deny" }
+  },
+  {
+    "name": "prod bulk write DML is deny (grade 3)",
+    "input": { "commandId": "db-exec", "opClass": "write", "profile": { "environment": "prod" } },
+    "expect": { "grade": 3, "action": "deny" }
+  },
+  {
+    "name": "dev DDL requires confirm (grade 2)",
+    "input": { "commandId": "db-push", "opClass": "ddl", "profile": { "environment": "dev" } },
+    "expect": { "grade": 2, "action": "confirm" }
+  },
+  {
+    "name": "staging DDL requires confirm (grade 2)",
+    "input": { "commandId": "migration-run", "opClass": "ddl", "profile": { "environment": "staging" } },
+    "expect": { "grade": 2, "action": "confirm" }
+  },
+  {
+    "name": "write DML requires confirm (grade 1)",
+    "input": { "commandId": "db-exec", "opClass": "write", "profile": { "environment": "dev" } },
+    "expect": { "grade": 1, "action": "confirm" }
+  },
+  {
+    "name": "SELECT read is frictionless allow even against prod (grade 0)",
+    "input": { "commandId": "query-run", "opClass": "read", "profile": { "environment": "prod" } },
+    "expect": { "grade": 0, "action": "allow" }
+  },
+  {
+    "name": "dev read is frictionless allow (grade 0)",
+    "input": { "commandId": "query-run", "opClass": "read", "profile": { "environment": "dev" } },
+    "expect": { "grade": 0, "action": "allow" }
+  },
+  {
+    "name": "profile host change is destructive confirm (grade 2)",
+    "input": { "commandId": "db-profile-add", "opClass": "profileMutation", "profile": { "environment": "dev" } },
+    "expect": { "grade": 2, "action": "confirm" }
+  },
+  {
+    "name": "profile readOnly release is destructive confirm even on prod-tier profile (grade 2)",
+    "input": { "commandId": "db-profile-add", "opClass": "profileMutation", "profile": { "environment": "prod", "readOnly": false } },
+    "expect": { "grade": 2, "action": "confirm" }
+  }
+]

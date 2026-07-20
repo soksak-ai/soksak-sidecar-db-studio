@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "note": "Language-neutral gate rule table. Single source for TS (UI) and Rust (sidecar) conformance. First matching rule wins; rules are ordered specific-first. A rule matches when every field it declares under `match` equals the input; `profile` sub-fields match individually. Derived from plans/db-connect-live-schema.md §5 (4-tier gate matrix) and §4-note (profile-mutation destructive promotion).",
+  "rules": [
+    {
+      "id": "prod-write-destructive",
+      "match": { "opClass": "write", "profile": { "environment": "prod" } },
+      "grade": 3,
+      "action": "deny"
+    },
+    {
+      "id": "prod-ddl-destructive",
+      "match": { "opClass": "ddl", "profile": { "environment": "prod" } },
+      "grade": 3,
+      "action": "deny"
+    },
+    {
+      "id": "profile-mutation-destructive",
+      "match": { "opClass": "profileMutation" },
+      "grade": 2,
+      "action": "confirm"
+    },
+    {
+      "id": "ddl-confirm",
+      "match": { "opClass": "ddl" },
+      "grade": 2,
+      "action": "confirm"
+    },
+    {
+      "id": "write-dml-confirm",
+      "match": { "opClass": "write" },
+      "grade": 1,
+      "action": "confirm"
+    },
+    {
+      "id": "read-allow",
+      "match": { "opClass": "read" },
+      "grade": 0,
+      "action": "allow"
+    },
+    {
+      "id": "default-deny",
+      "match": {},
+      "grade": 3,
+      "action": "deny"
+    }
+  ]
+}
