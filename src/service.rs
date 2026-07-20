@@ -958,19 +958,6 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// ping — liveness + driver identity. Pure (no connection needed).
-fn op_ping() -> Outcome {
-    Outcome::ok_msg(
-        json!({
-            "plugin": "soksak-sidecar-db-studio",
-            "version": VERSION,
-            "driver": "sqlite",
-            "sqlite_version": rusqlite::version(),
-        }),
-        "db-studio sidecar alive",
-    )
-}
-
 /// db-test — one-shot connection probe: open, read the server version, close. No
 /// pool entry (distinct from db-connect). Read-only, runs concurrently.
 fn op_db_test(params: &Value) -> Outcome {
@@ -992,7 +979,6 @@ fn op_db_test(params: &Value) -> Outcome {
 impl ServiceHandler for DbStudioService {
     fn ops(&self) -> Vec<String> {
         [
-            "db-ping",
             "db-test",
             "db-connect",
             "db-disconnect",
@@ -1014,8 +1000,7 @@ impl ServiceHandler for DbStudioService {
     fn read_only(&self, op: &str) -> bool {
         matches!(
             op,
-            "db-ping"
-                | "db-test"
+            "db-test"
                 | "db-status"
                 | "query-run"
                 | "db-introspect"
@@ -1026,7 +1011,6 @@ impl ServiceHandler for DbStudioService {
 
     fn handle(&self, op: &str, params: Value, _ctx: &OpCtx, _emit: &Emit) -> Outcome {
         match op {
-            "db-ping" => op_ping(),
             "db-test" => op_db_test(&params),
             "db-connect" => self.db_connect(&params),
             "db-disconnect" => self.db_disconnect(&params),
@@ -1052,16 +1036,6 @@ pub fn run_serve() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ping_reports_driver_and_versions() {
-        let o = op_ping();
-        assert!(o.ok);
-        let d = o.data.unwrap();
-        assert_eq!(d["plugin"], "soksak-sidecar-db-studio");
-        assert_eq!(d["driver"], "sqlite");
-        assert!(d["sqlite_version"].as_str().unwrap().starts_with("3."));
-    }
 
     #[test]
     fn db_test_probes_in_memory_sqlite() {
@@ -1121,7 +1095,7 @@ mod tests {
     fn unknown_op_is_rejected() {
         let svc = DbStudioService::new();
         let ops = svc.ops();
-        assert!(ops.contains(&"db-ping".to_string()));
+        assert!(ops.contains(&"db-test".to_string()));
         assert!(ops.contains(&"db-connect".to_string()));
         assert!(svc.read_only("db-status"));
         assert!(!svc.read_only("db-connect"));
