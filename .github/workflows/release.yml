@@ -59,7 +59,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: soksak-ai/soksak-spec
-          ref: d7f54852754195527f125d1fc11362316157d19b
+          ref: 24ff193f6f2c49cc76b610a58f5dbadabbdf639f
           path: .pipeline
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
