@@ -992,7 +992,7 @@ fn op_db_test(params: &Value) -> Outcome {
 impl ServiceHandler for DbStudioService {
     fn ops(&self) -> Vec<String> {
         [
-            "ping",
+            "db-ping",
             "db-test",
             "db-connect",
             "db-disconnect",
@@ -1014,7 +1014,7 @@ impl ServiceHandler for DbStudioService {
     fn read_only(&self, op: &str) -> bool {
         matches!(
             op,
-            "ping"
+            "db-ping"
                 | "db-test"
                 | "db-status"
                 | "query-run"
@@ -1026,7 +1026,7 @@ impl ServiceHandler for DbStudioService {
 
     fn handle(&self, op: &str, params: Value, _ctx: &OpCtx, _emit: &Emit) -> Outcome {
         match op {
-            "ping" => op_ping(),
+            "db-ping" => op_ping(),
             "db-test" => op_db_test(&params),
             "db-connect" => self.db_connect(&params),
             "db-disconnect" => self.db_disconnect(&params),
@@ -1121,7 +1121,7 @@ mod tests {
     fn unknown_op_is_rejected() {
         let svc = DbStudioService::new();
         let ops = svc.ops();
-        assert!(ops.contains(&"ping".to_string()));
+        assert!(ops.contains(&"db-ping".to_string()));
         assert!(ops.contains(&"db-connect".to_string()));
         assert!(svc.read_only("db-status"));
         assert!(!svc.read_only("db-connect"));

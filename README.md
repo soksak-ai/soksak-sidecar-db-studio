@@ -14,7 +14,7 @@ inside this process.
 ## Ops
 
 Connection lifecycle:
-- `ping` — liveness + driver identity (SQLite version).
+- `db-ping` — liveness + driver identity (SQLite version).
 - `db-test {file?, key?}` — one-shot connection probe (open, apply key, read version, close).
 - `db-connect {profile, file?, key?}` — open a connection and hold it under the profile id. An encrypted (SQLCipher) database needs its `key`; a wrong/absent key fails at connect.
 - `db-disconnect {profile}` — drop the held connection.
