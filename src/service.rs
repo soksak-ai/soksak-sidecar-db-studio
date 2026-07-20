@@ -857,8 +857,10 @@ fn introspect_catalog(
 ) -> rusqlite::Result<Vec<Value>> {
     let mut names: Vec<String> = {
         let mut stmt = conn.prepare(
+            // Exclude SQLite internals and our own migration ledger — they are
+            // bookkeeping, not user schema, and must not surface in the catalog.
             "SELECT name FROM sqlite_master WHERE type='table' \
-             AND name NOT LIKE 'sqlite_%' ORDER BY name",
+             AND name NOT LIKE 'sqlite_%' AND name <> '_soksak_migrations' ORDER BY name",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<String>>>()?
